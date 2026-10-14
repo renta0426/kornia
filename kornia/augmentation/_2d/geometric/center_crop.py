@@ -90,6 +90,8 @@ class CenterCrop(GeometricAugmentationBase2D):
 
     """
 
+    _preserve_batchwise_prob = True
+
     def __init__(
         self,
         size: Union[int, Tuple[int, int]],

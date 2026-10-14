@@ -152,10 +152,9 @@ class TestEmptyGeometricInverse(BaseTester):
         output = sequence(image)
         saved_params = deepcopy(sequence._params)
 
-        # With p < 1 an empty batch keeps its input size, because the blend falls back to the skipped
-        # branch (tracked in #4429). This pins the current forward, which the tracked shapes must follow.
-        crop_size = (4, 5) if crop_p == 1.0 else (height, width)
-        output_size = (3, 4) if resize_p == 1.0 else crop_size
+        # Shape history follows the saved batch-wide decisions, even without sample rows.
+        crop_size = (4, 5) if saved_params[0].data["_batchwise_apply"] else (height, width)
+        output_size = (3, 4) if saved_params[1].data["_batchwise_apply"] else crop_size
         assert saved_params[0].data["forward_input_shape"].tolist() == [0, 3, height, width]
         assert saved_params[1].data["forward_input_shape"].tolist() == [0, 3, *crop_size]
         assert output.shape == (0, 3, *output_size)
@@ -373,9 +372,8 @@ class TestEmptyGeometricInverse(BaseTester):
             pytest.skip("The forward resampling kernel does not support this device/dtype's backward pass.")
         image = torch.empty(0, 3, 6, 8, device=device, dtype=dtype, requires_grad=True)
         output = aug(image)
-        # With p < 1 an empty batch keeps its input size (blend fallback, tracked in #4429); the inverse
-        # must undo whichever size the forward produced.
-        expected_size = output_size if p == 1.0 else (6, 8)
+        # The inverse restores the original canvas for either saved batch-wide decision.
+        expected_size = output_size if aug._params["_batchwise_apply"] else (6, 8)
         assert output.shape == (0, 3, *expected_size)
         restored = aug.inverse(output)
         assert restored.shape == image.shape
@@ -528,8 +526,8 @@ class TestEmptyCenterResizedCropHistory(BaseTester):
         for key in standalone:
             self.assert_close(params[0].data[key], standalone[key], rtol=0, atol=0)
         assert params[0].data["forward_input_shape"].tolist() == [0, 3, *input_size]
-        # Follow the current empty-gate blend, not a desired probability specification (#4429).
-        expected_size = crop_size if p == 1.0 else input_size
+        # Follow the saved decision instead of treating every empty sample gate as skipped.
+        expected_size = crop_size if params[0].data["_batchwise_apply"] else input_size
         assert params[1].data["forward_input_shape"].tolist() == [0, 3, *expected_size]
         if crop_type is K.CenterCrop:
             assert params[0].data["output_size"].shape == (0, 2)

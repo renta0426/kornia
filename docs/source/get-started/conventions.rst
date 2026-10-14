@@ -605,6 +605,19 @@ Randomness in augmentations
   ``ValueError`` when the gate mixes applied and skipped samples
   (`#4497 <https://github.com/kornia/kornia/issues/4497>`_).
 
+
+- For an empty batch, 2D ``RandomCrop``, ``CenterCrop``, ``RandomResizedCrop``
+  and ``Resize`` retain the sampled whole-batch decision in their parameters.
+  It selects the output canvas for images, tensor masks and downstream parameter
+  generation, including in video containers. Replay with a copy of the complete
+  parameters preserves that decision without another draw. The private metadata
+  is also included in nonempty shared draws for video broadcasting; existing sample
+  parameters, nonempty outputs and random-number consumption are unchanged. Older empty-batch
+  parameters without this metadata keep the input canvas when ``p < 1``;
+  static ``p=1`` still always applies. A tensor-dependent choice of output size
+  is not supported by ``torch.export``; deterministic always-applied transforms
+  retain their existing export path.
+
 Serializing an augmentation
 ^^^^^^^^^^^^^^^^^^^^^^^^^^^
 

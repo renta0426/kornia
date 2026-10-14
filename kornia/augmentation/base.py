@@ -98,6 +98,8 @@ class _BasicAugmentationBase(nn.Module):
     # Users can introspect via ``aug.exportable``; CI iterates the known-exportable
     # subset in ``tests/augmentation/test_onnx_export.py``.
     ONNX_EXPORTABLE = True
+    # Shape-changing operations with a batch-wide gate retain it independently of sample rows.
+    _preserve_batchwise_prob = False
 
     def __init_subclass__(cls, **kwargs: Any) -> None:
         super().__init_subclass__(**kwargs)
@@ -227,6 +229,7 @@ class _BasicAugmentationBase(nn.Module):
         p: float,
         p_batch: float,
         same_on_batch: bool,
+        _batchwise_params: Optional[Dict[str, torch.Tensor]] = None,
     ) -> torch.Tensor:
         batch_prob: torch.Tensor
         if p_batch == 1:
@@ -235,6 +238,9 @@ class _BasicAugmentationBase(nn.Module):
             batch_prob = torch.zeros(1, device=self.device, dtype=self.dtype)
         else:
             batch_prob = (torch.rand(1, device=self.device) < p_batch).to(self.dtype)
+
+        if _batchwise_params is not None:
+            _batchwise_params["_batchwise_apply"] = batch_prob.squeeze(0)
 
         # Per-sample gate. `p` and `same_on_batch` are Python values, so these branches are
         # resolved at trace time (no graph break).
@@ -305,10 +311,19 @@ class _BasicAugmentationBase(nn.Module):
         return params, flags
 
     def forward_parameters(self, batch_shape: Tuple[int, ...]) -> Dict[str, torch.Tensor]:
-        batch_prob = self.__batch_prob_generator__(batch_shape, self.p, self.p_batch, self.same_on_batch)
+        # Keep the existing draw before expansion erases it at B=0. Record it for nonempty
+        # draws too: VideoSequential can broadcast a shared draw to an empty public batch.
+        batchwise_params: Dict[str, torch.Tensor] = {}
+        if self._preserve_batchwise_prob:
+            batch_prob = self.__batch_prob_generator__(
+                batch_shape, self.p, self.p_batch, self.same_on_batch, batchwise_params
+            )
+        else:
+            batch_prob = self.__batch_prob_generator__(batch_shape, self.p, self.p_batch, self.same_on_batch)
         _params = self.generate_parameters(batch_shape)
         if _params is None:
             _params = {}
+        _params.update(batchwise_params)
         _params["batch_prob"] = batch_prob
         # Added another input_size parameter for geometric transformations
         # This might be needed for correctly inversing.
@@ -394,7 +409,10 @@ class _AugmentationBase(_BasicAugmentationBase):
 
     @staticmethod
     def _blend_by_prob(
-        transformed: torch.Tensor, not_transformed: torch.Tensor, to_apply: torch.Tensor
+        transformed: torch.Tensor,
+        not_transformed: torch.Tensor,
+        to_apply: torch.Tensor,
+        batchwise_apply: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         """Select transformed vs non-transformed samples element-wise by ``to_apply``.
 
@@ -402,11 +420,15 @@ class _AugmentationBase(_BasicAugmentationBase):
         fullgraph-friendly). Shape-changing augmentations (e.g. crop/resize) whose branches
         differ in spatial size fall back to a Python branch on ``to_apply.any()``, which is
         not onnx-exportable. Such a fallback cannot select rows, so a ``to_apply`` that mixes applied and skipped
-        rows raises ``ValueError`` instead of transforming the skipped rows too.
+        rows raises ``ValueError`` instead of transforming the skipped rows too. With no sample rows,
+        ``batchwise_apply`` selects the canvas; older params without it keep the untransformed canvas.
         """
         if transformed.shape == not_transformed.shape and transformed.shape[0] == to_apply.shape[0]:
             to_apply_expanded = to_apply.view(-1, *([1] * (len(transformed.shape) - 1))).to(transformed.device)
             return torch.where(to_apply_expanded, transformed, not_transformed)
+        # Old saved params have no batch-wide decision and retain the empty-gate fallback.
+        if to_apply.numel() == 0 and batchwise_apply is not None:
+            return transformed if bool(batchwise_apply) else not_transformed
         apply_any = bool(to_apply.any())
         if apply_any and not bool(to_apply.all()) and transformed.shape[1:] != not_transformed.shape[1:]:
             raise _mixed_gate_shape_error(not_transformed.shape[1:], transformed.shape[1:])
@@ -457,7 +479,9 @@ class _AugmentationBase(_BasicAugmentationBase):
                 transform_input = torch.where(gate, in_tensor, 0.5)
             output_transformed = self.apply_transform(transform_input, params, flags, transform=transform)
             output_not_transformed = self.apply_non_transform(in_tensor, params, flags, transform=transform)
-            output = self._blend_by_prob(output_transformed, output_not_transformed, to_apply)
+            output = self._blend_by_prob(
+                output_transformed, output_not_transformed, to_apply, params.get("_batchwise_apply")
+            )
 
         if is_autocast_enabled():
             output = output.type(input.dtype)
@@ -504,7 +528,9 @@ class _AugmentationBase(_BasicAugmentationBase):
         if self.p == 1.0 and self.p_batch == 1.0 and batch_prob.numel() == 0:
             output = output_transformed
         else:
-            output = self._blend_by_prob(output_transformed, output_not_transformed, to_apply)
+            output = self._blend_by_prob(
+                output_transformed, output_not_transformed, to_apply, params.get("_batchwise_apply")
+            )
 
         if not self.keepdim:
             return output

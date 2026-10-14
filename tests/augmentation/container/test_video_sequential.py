@@ -261,3 +261,35 @@ class TestVideoSequential:
         boxes = torch.rand(0, 3, 2, 4, 2, device=device, dtype=dtype)
         assert aug.transform_boxes(boxes, params).shape == boxes.shape
         assert aug.inverse_boxes(boxes, params).shape == boxes.shape
+
+
+@pytest.mark.parametrize("same_on_frame", [False, True])
+@pytest.mark.parametrize("same_on_batch", [False, True])
+@pytest.mark.parametrize("apply", [False, True])
+def test_empty_video_batch_decision_4429(same_on_frame, same_on_batch, apply, device, dtype):
+    from copy import deepcopy
+    from unittest.mock import patch
+
+    def make_seq():
+        return K.VideoSequential(
+            K.RandomCrop((4, 5), p=0.5, same_on_batch=same_on_batch),
+            K.Resize((2, 3)),
+            data_format="BTCHW",
+            same_on_frame=same_on_frame,
+        )
+
+    image = torch.empty(0, 2, 3, 9, 13, device=device, dtype=dtype)
+    seq = make_seq()
+    with patch("torch.rand", return_value=torch.tensor([0.0 if apply else 1.0])):
+        params = deepcopy(seq.forward_parameters(image.shape))
+    assert params[0].data["batch_prob"].shape == (0,)
+    assert params[0].data["_batchwise_apply"].ndim == 0
+    expected = (4, 5) if apply else (9, 13)
+    seq(image)
+    fresh = make_seq()
+    seen = []
+    handle = fresh[1].register_forward_pre_hook(lambda module, args: seen.append(args[0].shape))
+    assert fresh(image, params=params).shape == (0, 2, 3, 2, 3)
+    handle.remove()
+    assert seen == [torch.Size((0, 3, *expected))]
+    assert tuple(params[1].data["forward_input_shape"][-2:]) == expected

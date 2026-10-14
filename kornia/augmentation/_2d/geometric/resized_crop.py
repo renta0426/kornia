@@ -111,6 +111,8 @@ class RandomResizedCrop(GeometricAugmentationBase2D):
 
     """
 
+    _preserve_batchwise_prob = True
+
     def __init__(
         self,
         size: Tuple[int, int],

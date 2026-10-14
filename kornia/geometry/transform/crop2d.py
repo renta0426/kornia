@@ -546,6 +546,10 @@ def crop_by_indices(
                 "Please pass `size` explicitly when box dimensions vary across the batch."
             )
         size = (int(h[0].item()), int(w[0].item())) if B > 0 else (0, 0)
+    if B == 0:
+        # Keep the selected empty canvas connected to the input for backward.
+        return input_tensor.reshape(B, C, *size)
+
     # Unbind only when batch-slice gradients would allocate a full input buffer for every crop. On that
     # path the rows are also joined with one ``cat``: writing them into ``out`` row by row would make the
     # backward clone the gradient of the whole output once per row.

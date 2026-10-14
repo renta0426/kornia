@@ -276,7 +276,7 @@ class VideoSequential(ImageSequential):
                         # TODO: revise ColorJiggle and ColorJitter order param in the future to align the standard.
                         if k == "order" and isinstance(module, (K.ColorJiggle, K.ColorJitter)):
                             continue
-                        if k == "video_batch_size":
+                        if k in ("video_batch_size", "_batchwise_apply"):
                             continue
                         if k == "forward_input_shape":
                             mod_param.update({k: v})

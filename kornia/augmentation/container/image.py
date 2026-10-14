@@ -474,9 +474,9 @@ def _get_new_batch_shape(param: ParamItem, batch_shape: torch.Size, module: Opti
     Note:
        Augmentations that change the image size must provide the parameter `output_size`.
        Empty RandomCrop, CenterCrop, RandomResizedCrop and Resize batches have no sampled
-       output-size rows, so their configured size is used only when the image forward path
-       always applies the transform. Other probability branches retain the current empty-gate
-       fallback tracked in #4429.
+       output-size rows, so their configured size follows the saved batch-wide decision.
+       Older params without that decision retain the empty-gate fallback unless the module
+       is statically always applied.
 
     """
     data = param.data
@@ -509,10 +509,10 @@ def _get_new_batch_shape(param: ParamItem, batch_shape: torch.Size, module: Opti
         return batch_shape
 
     if batch_shape[0] == 0 and isinstance(module, (K.RandomCrop, K.CenterCrop, K.RandomResizedCrop, K.Resize)):
-        # Match the image forward's unconditional path. An empty gate selects the original
-        # canvas in the other probability branches, including Resize's p_batch setting (#4429).
         if module.p != 1.0 or module.p_batch != 1.0:
-            return batch_shape
+            decision = data.get("_batchwise_apply")
+            if decision is None or not bool(decision):
+                return batch_shape
         size = module.flags["size"]
         if isinstance(module, K.Resize) and isinstance(size, int):
             size = _side_to_image_size(size, batch_shape[-1] / batch_shape[-2], module.flags["side"])

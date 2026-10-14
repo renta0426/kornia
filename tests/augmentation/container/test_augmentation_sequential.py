@@ -2485,8 +2485,8 @@ class TestConventionAugmentationSequential(BaseTester):
     )
     @pytest.mark.parametrize("p", [0.5, 1.0])
     def test_empty_batch_mask_round_trip_follows_image_4429(self, make_op, p, device, dtype):
-        # The mask takes the image's canvas under every gate, and the inverse restores both. With p < 1 the empty
-        # image keeps its input size (the blend fallback tracked in #4429), so only the parity is pinned here.
+        # The mask takes the image's selected canvas under every gate, and inverse restores both.
+        # Deterministic batch-wide decisions and downstream shapes are covered in TestEmptyBatchDecision.
         image = torch.empty(0, 3, 8, 10, device=device, dtype=dtype)
         mask = torch.empty(0, 1, 8, 10, device=device, dtype=torch.int64)
         seq = K.AugmentationSequential(make_op(p), data_keys=["input", "mask"])
@@ -2991,3 +2991,77 @@ class TestAugmentationSequentialReplay:
             aug(torch.rand(3, 1, 15, 17, device=device, dtype=dtype), keypoints[:1].expand(3, -1, -1))
             replayed = aug(keypoints, params=params, data_keys=["keypoints"])
             assert_close(replayed, expected)
+
+
+class TestEmptyBatchDecision(BaseTester):
+    @pytest.mark.parametrize("op", [K.RandomCrop, K.CenterCrop, K.RandomResizedCrop, K.Resize])
+    @pytest.mark.parametrize("apply", [False, True])
+    def test_saved_decision_shape_mask_and_replay_4429(self, op, apply, device, dtype):
+        from copy import deepcopy
+
+        def make_seq():
+            return K.AugmentationSequential(op((4, 5), p=0.5), K.Resize((2, 3)), data_keys=["input", "mask"])
+
+        image = torch.empty(0, 3, 9, 13, device=device, dtype=dtype)
+        mask = torch.empty(0, 1, 9, 13, device=device, dtype=torch.int64)
+        seq = make_seq()
+        with patch("torch.rand", return_value=torch.tensor([0.0 if apply else 1.0])):
+            saved = deepcopy(seq.forward_parameters(image.shape))
+        assert saved[0].data["batch_prob"].shape == (0,)
+        assert saved[0].data["_batchwise_apply"].ndim == 0
+        expected = (4, 5) if apply else (9, 13)
+        # Overwrite the module state, then replay on both the same and a fresh instance.
+        seq(image, mask)
+        for replay in (seq, make_seq()):
+            seen = []
+            handle = replay[1].register_forward_pre_hook(lambda module, args, seen=seen: seen.append(args[0].shape))
+            with patch.object(replay[1], "transform_masks", wraps=replay[1].transform_masks) as masks:
+                out_image, out_mask = replay(image, mask, params=deepcopy(saved))
+            assert masks.call_args.args[0].shape == (0, 1, *expected)
+            handle.remove()
+            assert seen == [torch.Size((0, 3, *expected))]
+            assert tuple(saved[1].data["forward_input_shape"]) == seen[0]
+            assert out_image.shape == (0, 3, 2, 3)
+            assert out_mask.shape == (0, 1, 2, 3)
+            assert out_mask.dtype == mask.dtype
+
+    @pytest.mark.parametrize("p", [0.0, 0.5, 1.0])
+    def test_legacy_params_and_static_gate_4429(self, p, device, dtype):
+        image = torch.empty(0, 3, 9, 13, device=device, dtype=dtype)
+        seq = K.AugmentationSequential(K.Resize((4, 5), p=p), K.Resize((2, 3)))
+        params = seq.forward_parameters(image.shape)
+        del params[0].data["_batchwise_apply"]
+        from kornia.augmentation.container.image import _get_new_batch_shape
+
+        expected = (4, 5) if p == 1.0 else (9, 13)
+        assert seq[0](image, params=params[0].data).shape[-2:] == expected
+        assert _get_new_batch_shape(params[0], image.shape, seq[0])[-2:] == expected
+        # Static always-apply must also ignore a contradictory new decision.
+        if p == 1.0:
+            params[0].data["_batchwise_apply"] = torch.tensor(0.0)
+            assert seq[0](image, params=params[0].data).shape[-2:] == expected
+            assert _get_new_batch_shape(params[0], image.shape, seq[0])[-2:] == expected
+
+    def test_dynamo_saved_empty_decision_4429(self, device, dtype, torch_optimizer):
+        image = torch.empty(0, 3, 9, 13, device=device, dtype=dtype)
+        op = K.Resize((4, 5), p=0.5)
+        params = op.forward_parameters(image.shape)
+        compiled = torch_optimizer(op)
+        for apply in (False, True):
+            params["_batchwise_apply"].fill_(apply)
+            actual = compiled(image, params=params)
+            assert actual.shape == (0, 3, *((4, 5) if apply else (9, 13)))
+            self.assert_close(actual, op(image, params=params))
+
+    @pytest.mark.parametrize("op", [K.RandomCrop, K.RandomResizedCrop])
+    @pytest.mark.parametrize("apply", [False, True])
+    def test_empty_slice_backward(self, op, apply, device, dtype):
+        image = torch.empty(0, 3, 9, 13, device=device, dtype=dtype, requires_grad=True)
+        aug = op((4, 5), p=0.5)
+        params = aug.forward_parameters(image.shape)
+        params["_batchwise_apply"].fill_(apply)
+        output = aug(image, params=params)
+        assert output.shape == (0, 3, *((4, 5) if apply else (9, 13)))
+        output.sum().backward()
+        assert image.grad is not None
+        assert image.grad.shape == image.shape
